@@ -41,7 +41,7 @@ def accept_new_connection(server_socket: socket.socket, poller: select.poll, con
         conn = Conn(con_socket)
         connections[conn.fd] = conn
 
-        poller.register(conn.fd, select.EPOLLIN)
+        poller.register(conn.fd, select.POLLIN)
 
     except OSError as e:
         # BlockingIOError (no pending connection) or ConnectionAbortedError (client gave up before accept)
@@ -86,8 +86,8 @@ def process_read_buffer(conn: Conn, poller: select.poll, connections: dict[int, 
 
     while len(conn.rbuf) >= 4:
         # Unpack length (little-endian uint32)
-        if len(conn.wbuf - conn.wbuf_sent) > MAX_WBUF:
-            print("Error: Write buffer exceeds maximum allowed size")
+        if len(conn.wbuf) - conn.wbuf_sent > MAX_WBUF:
+            print("Write buffer exceeds maximum allowed size")
             break
 
         length = struct.unpack('<I', conn.rbuf[:4])[0]
@@ -116,6 +116,17 @@ def process_read_buffer(conn: Conn, poller: select.poll, connections: dict[int, 
     if conn.wbuf:
         conn.state = STATE_WRITE
 
+def process_and_flush(conn: Conn, poller: select.poll, connections: dict[int, Conn]):
+    while True:
+        process_read_buffer(conn, poller, connections)
+        if conn.state != STATE_WRITE:
+            return  # need more data, or connection marked for delete
+        send_response(conn, poller, connections)
+        if conn.state != STATE_READ:
+            return  # kernel send buffer full, wait for POLLOUT
+        # wbuf fully drained: rbuf may still hold requests held back by MAX_WBUF,
+        # and no POLLIN will come for them, so loop and process them now
+
 def connection_io(conn: Conn, event: int, poller: select.poll, connections: dict[int, Conn]):
     if event & (select.POLLERR | select.POLLNVAL):
         # Socket error or invalid fd, nothing more can be done with this connection
@@ -123,9 +134,7 @@ def connection_io(conn: Conn, event: int, poller: select.poll, connections: dict
     elif conn.state == STATE_READ:
         try:
             fill_buffer(conn)
-            process_read_buffer(conn, poller, connections)
-            if conn.state == STATE_WRITE:
-                send_response(conn, poller, connections)
+            process_and_flush(conn, poller, connections)
         except OSError as e:
             # ConnectionResetError, etc. Drop this client only, keep the server running
             print("Connection error:", e)
@@ -133,16 +142,18 @@ def connection_io(conn: Conn, event: int, poller: select.poll, connections: dict
     elif conn.state == STATE_WRITE:
         try:
             send_response(conn, poller, connections)
-            process_read_buffer(conn, poller, connections)
+            if conn.state == STATE_READ:
+                # wbuf drained: handle requests left in rbuf by backpressure
+                process_and_flush(conn, poller, connections)
         except OSError as e:
             # BrokenPipeError, ConnectionResetError, etc.
             print("Connection error:", e)
             conn.state = STATE_DELETE
 
     if conn.state == STATE_READ:
-        poller.modify(conn.fd, select.EPOLLIN)
+        poller.modify(conn.fd, select.POLLIN)
     elif conn.state == STATE_WRITE:
-        poller.modify(conn.fd, select.EPOLLOUT)
+        poller.modify(conn.fd, select.POLLOUT)
     elif conn.state == STATE_DELETE:
         poller.unregister(conn.fd)
         conn.con_socket.close()
@@ -159,16 +170,16 @@ def run_server(host: str = '127.0.0.1', port: int = 5050):
     server_socket.setblocking(False)
 
 
-    poller = select.epoll()
+    poller = select.poll()
 
-    poller.register(server_socket, select.EPOLLIN)
+    poller.register(server_socket, select.POLLIN)
 
     #Connection dictionary to keep track of active connections
     connections: dict[int, Conn] = {}
 
     while True:
         #Polling for events
-        events = poller.poll(1)  # Timeout in seconds
+        events = poller.poll(1000)  # Timeout in milliseconds
 
         for fd, event in events:
             #new connection
