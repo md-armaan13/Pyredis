@@ -1,14 +1,23 @@
 import struct
 import socket
 import select
-
+from typing import Optional, List
 
 MAX_MSG_SIZE = 4096
 MAX_WBUF = 64 * 1024  # 64 KiB
+MAX_ARGS = 1024
 
 STATE_READ = 0
 STATE_WRITE = 1
 STATE_DELETE = 2
+
+#Status Code
+RES_OK = 0
+RES_ERR = 1
+RES_NX = 2
+
+
+g_map: dict[bytes, bytes] = {}
 class Conn:
     def __init__(self, con_socket: socket.socket):
         self.con_socket = con_socket
@@ -17,6 +26,78 @@ class Conn:
         self.rbuf = bytearray()
         self.wbuf = bytearray()
         self.wbuf_sent = 0
+
+def _get(cmd: List[bytes]) -> tuple[int, bytes]:
+    key = cmd[1]
+    if key not in g_map:
+        return RES_NX, b""
+
+    return RES_OK, g_map[key]
+
+def _set(cmd: List[bytes]) -> tuple[int, bytes]:
+    key, value = cmd[1], cmd[2]
+    g_map[key] = value
+    return RES_OK, b""
+
+def _del(cmd: List[bytes]) -> tuple[int, bytes]:
+    key = cmd[1]
+    if key in g_map:
+        del g_map[key]
+    return RES_OK, b""
+
+def parse_req(data: bytes) -> Optional[List[bytes]]:
+
+    if len(data) < 4:
+        print("Not enough data to parse")
+        return None
+
+    #Read no of args
+    (n_args,) = struct.unpack('<I', data[:4])
+
+    if n_args > MAX_ARGS:
+        print("Error: Max no of args supplied")
+        return None
+
+    cmd = []
+    pos = 4
+
+    for _ in range(n_args):
+        if pos + 4 > len(data):
+            print("Error: Incomplete data")
+            return None
+        (sz,) = struct.unpack('<I', data[pos:pos + 4])
+        pos +=4
+
+        if pos + sz > len(data):
+            print("Error: Incomplete Data")
+            return None
+
+        cmd.append(data[pos: pos + sz])
+        pos+=sz
+
+    if pos!=len(data):
+        print("Error: parsing the request")
+        return None
+
+    return cmd
+
+def process_command(req_payload: bytes) -> tuple[int , bytes]:
+
+    cmd = parse_req(req_payload)
+
+    if cmd is None or len(cmd) == 0:
+        return RES_ERR, b"bad req"
+
+    cmd_name = cmd[0].lower()
+
+    if len(cmd) == 2 and cmd_name == b"get":
+        return _get(cmd)
+    elif len(cmd) == 3 and cmd_name == b"set":
+        return _set(cmd)
+    elif len(cmd) == 2 and cmd_name == b"del":
+        return _del(cmd)
+    else:
+        return RES_ERR, b"Unknown cmd"
 
 def fill_buffer(conn: Conn) -> bool:
     while True:
@@ -101,16 +182,22 @@ def process_read_buffer(conn: Conn, poller: select.poll, connections: dict[int, 
             # Not enough data yet, but replies for earlier messages may already be in wbuf
             break
 
-        payload = conn.rbuf[4:4 + length]
-        print("Received payload:", payload.decode('utf-8', errors='replace'))
+        payload = bytes(conn.rbuf[4:4 + length])
+        # print("Received payload:", payload.decode('utf-8', errors='replace'))
+
+        #Execute the Command
+        try:
+            rescode , res_data = process_command(payload)
+        except Exception as e:
+            print("Command error", e)
+            rescode, res_data = RES_ERR, b"internal error"
+            
         del conn.rbuf[:4 + length]  # Remove processed data from rbuf
 
         # Construct the reply message
-        reply = "Hello, client!".encode('utf-8')
-        reply_length = len(reply)
-        reply_header = struct.pack('<I', reply_length)
-        reply = reply_header + reply
-        conn.wbuf.extend(reply)  # Store the reply in the write buffer
+        inner_len = 4 + len(res_data)
+        response_msg = struct.pack('<I', inner_len) + struct.pack('<I', rescode) + res_data
+        conn.wbuf.extend(response_msg)
 
     # All replies for this batch are buffered, switch to write if there is anything to send
     if conn.wbuf:
@@ -126,6 +213,7 @@ def process_and_flush(conn: Conn, poller: select.poll, connections: dict[int, Co
             return  # kernel send buffer full, wait for POLLOUT
         # wbuf fully drained: rbuf may still hold requests held back by MAX_WBUF,
         # and no POLLIN will come for them, so loop and process them now
+
 
 def connection_io(conn: Conn, event: int, poller: select.poll, connections: dict[int, Conn]):
     if event & (select.POLLERR | select.POLLNVAL):

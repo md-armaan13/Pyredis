@@ -1,10 +1,15 @@
-"""Tests for event_loop_server.py
+"""Tests for server.py
 
 Run with:  python3 -m unittest -v test_event_loop_server
 
 Two groups:
-  - Unit tests: call the server functions directly on a socketpair (no server process).
+  - Unit tests: call the server functions directly (parser, commands, and the
+    event-loop helpers on a socketpair). No server process.
   - Integration tests: start the real server in a subprocess and talk to it over TCP.
+
+Wire format (inside the outer 4-byte length frame):
+  request:  nstr | len | str1 | len | str2 | ...
+  response: res (uint32) | data...
 """
 import os
 import select
@@ -14,12 +19,13 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 import server as srv
-from server import Conn, STATE_READ, STATE_WRITE, STATE_DELETE, MAX_MSG_SIZE
+from server import (Conn, STATE_READ, STATE_WRITE, STATE_DELETE, MAX_MSG_SIZE, MAX_ARGS,
+                    RES_OK, RES_ERR, RES_NX)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPLY_BODY = b"Hello, client!"
 
 
 def frame(payload: bytes) -> bytes:
@@ -27,7 +33,28 @@ def frame(payload: bytes) -> bytes:
     return struct.pack('<I', len(payload)) + payload
 
 
-REPLY = frame(REPLY_BODY)
+def req_payload(*args: bytes) -> bytes:
+    # Inner request payload: nstr, then len + bytes for each argument
+    out = struct.pack('<I', len(args))
+    for a in args:
+        out += struct.pack('<I', len(a)) + a
+    return out
+
+
+def req(*args: bytes) -> bytes:
+    # Full request as sent on the wire
+    return frame(req_payload(*args))
+
+
+def reply(code: int, data: bytes = b"") -> bytes:
+    # Full response as sent on the wire
+    return frame(struct.pack('<I', code) + data)
+
+
+OK = reply(RES_OK)
+NX = reply(RES_NX)
+BAD_REQ = reply(RES_ERR, b"bad req")
+UNKNOWN = reply(RES_ERR, b"Unknown cmd")
 
 
 def recv_exact(sock: socket.socket, n: int, timeout: float = 3.0) -> bytes:
@@ -41,6 +68,13 @@ def recv_exact(sock: socket.socket, n: int, timeout: float = 3.0) -> bytes:
     return bytes(buf)
 
 
+def read_reply(sock: socket.socket) -> tuple[int, bytes]:
+    (length,) = struct.unpack('<I', recv_exact(sock, 4))
+    body = recv_exact(sock, length)
+    (code,) = struct.unpack('<I', body[:4])
+    return code, body[4:]
+
+
 def make_conn():
     # server side is non-blocking, exactly like accept_new_connection() sets it up
     server_side, client_side = socket.socketpair()
@@ -49,7 +83,7 @@ def make_conn():
 
 
 def quiet(fn, *args):
-    # The server prints every payload; keep test output readable
+    # The server prints on malformed input; keep test output readable
     with open(os.devnull, 'w') as devnull:
         old = sys.stdout
         sys.stdout = devnull
@@ -60,11 +94,124 @@ def quiet(fn, *args):
 
 
 # ---------------------------------------------------------------------------
-# Unit tests
+# Unit tests: request parsing
+# ---------------------------------------------------------------------------
+
+class TestParseReq(unittest.TestCase):
+    def parse(self, data):
+        return quiet(srv.parse_req, data)
+
+    def test_set_command(self):
+        self.assertEqual(self.parse(req_payload(b"set", b"k", b"v")), [b"set", b"k", b"v"])
+
+    def test_zero_args(self):
+        self.assertEqual(self.parse(req_payload()), [])
+
+    def test_empty_string_argument(self):
+        self.assertEqual(self.parse(req_payload(b"get", b"")), [b"get", b""])
+
+    def test_binary_argument(self):
+        blob = bytes(range(256))
+        self.assertEqual(self.parse(req_payload(b"set", b"k", blob)), [b"set", b"k", blob])
+
+    def test_payload_shorter_than_nstr(self):
+        self.assertIsNone(self.parse(b""))
+        self.assertIsNone(self.parse(b"\x01\x00\x00"))
+
+    def test_too_many_args(self):
+        # Well-formed in every other way, so only the MAX_ARGS check can reject it
+        self.assertIsNone(self.parse(req_payload(*[b"x"] * (MAX_ARGS + 1))))
+
+    def test_max_args_accepted(self):
+        args = [b"x"] * MAX_ARGS
+        self.assertEqual(self.parse(req_payload(*args)), args)
+
+    def test_nstr_larger_than_args_present(self):
+        # Claims 3 args but only carries 1
+        data = struct.pack('<I', 3) + struct.pack('<I', 3) + b"get"
+        self.assertIsNone(self.parse(data))
+
+    def test_truncated_length_field(self):
+        data = struct.pack('<I', 1) + b"\x03\x00"
+        self.assertIsNone(self.parse(data))
+
+    def test_length_points_past_end(self):
+        data = struct.pack('<I', 1) + struct.pack('<I', 10) + b"get"
+        self.assertIsNone(self.parse(data))
+
+    def test_trailing_bytes_rejected(self):
+        self.assertIsNone(self.parse(req_payload(b"get", b"k") + b"x"))
+
+    def test_raw_text_rejected(self):
+        self.assertIsNone(self.parse(b"Hello, server!"))
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: command execution against g_map
+# ---------------------------------------------------------------------------
+
+class TestProcessCommand(unittest.TestCase):
+    def setUp(self):
+        srv.g_map.clear()
+
+    def run_cmd(self, *args):
+        return quiet(srv.process_command, req_payload(*args))
+
+    def test_set_then_get(self):
+        self.assertEqual(self.run_cmd(b"set", b"k", b"v"), (RES_OK, b""))
+        self.assertEqual(self.run_cmd(b"get", b"k"), (RES_OK, b"v"))
+
+    def test_set_overwrites(self):
+        self.run_cmd(b"set", b"k", b"v1")
+        self.run_cmd(b"set", b"k", b"v2")
+        self.assertEqual(self.run_cmd(b"get", b"k"), (RES_OK, b"v2"))
+
+    def test_get_missing_key(self):
+        self.assertEqual(self.run_cmd(b"get", b"nope"), (RES_NX, b""))
+
+    def test_empty_value_is_not_missing(self):
+        self.run_cmd(b"set", b"k", b"")
+        self.assertEqual(self.run_cmd(b"get", b"k"), (RES_OK, b""))
+
+    def test_del_existing_key(self):
+        self.run_cmd(b"set", b"k", b"v")
+        self.assertEqual(self.run_cmd(b"del", b"k"), (RES_OK, b""))
+        self.assertEqual(self.run_cmd(b"get", b"k"), (RES_NX, b""))
+
+    def test_del_missing_key_is_ok(self):
+        self.assertEqual(self.run_cmd(b"del", b"nope"), (RES_OK, b""))
+
+    def test_command_name_case_insensitive(self):
+        self.run_cmd(b"SET", b"k", b"v")
+        self.assertEqual(self.run_cmd(b"GeT", b"k"), (RES_OK, b"v"))
+
+    def test_keys_are_case_sensitive(self):
+        self.run_cmd(b"set", b"K", b"v")
+        self.assertEqual(self.run_cmd(b"get", b"k"), (RES_NX, b""))
+
+    def test_unknown_command(self):
+        self.assertEqual(self.run_cmd(b"foo"), (RES_ERR, b"Unknown cmd"))
+
+    def test_wrong_arg_count(self):
+        for args in [(b"get",), (b"get", b"a", b"b"), (b"set", b"k"),
+                     (b"set", b"k", b"v", b"x"), (b"del",), (b"del", b"a", b"b")]:
+            with self.subTest(args=args):
+                self.assertEqual(self.run_cmd(*args), (RES_ERR, b"Unknown cmd"))
+
+    def test_zero_args_is_bad_request(self):
+        self.assertEqual(self.run_cmd(), (RES_ERR, b"bad req"))
+
+    def test_malformed_payload_is_bad_request(self):
+        self.assertEqual(quiet(srv.process_command, b"Hello, server!"), (RES_ERR, b"bad req"))
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: event-loop helpers
 # ---------------------------------------------------------------------------
 
 class TestProcessReadBuffer(unittest.TestCase):
     def setUp(self):
+        srv.g_map.clear()
         self.conn, self.peer = make_conn()
 
     def tearDown(self):
@@ -87,61 +234,81 @@ class TestProcessReadBuffer(unittest.TestCase):
         self.assertEqual(self.conn.wbuf, b"")
 
     def test_incomplete_body_waits(self):
-        self.conn.rbuf.extend(frame(b"set k v")[:8])  # header + 4 of 7 body bytes
+        data = req(b"set", b"k", b"v")
+        self.conn.rbuf.extend(data[:10])  # header + part of the body
         self.process()
         self.assertEqual(self.conn.state, STATE_READ)
-        self.assertEqual(len(self.conn.rbuf), 8)
+        self.assertEqual(len(self.conn.rbuf), 10)
         self.assertEqual(self.conn.wbuf, b"")
 
-    def test_one_complete_message(self):
-        self.conn.rbuf.extend(frame(b"set k v"))
+    def test_one_complete_request(self):
+        self.conn.rbuf.extend(req(b"set", b"k", b"v"))
         self.process()
         self.assertEqual(self.conn.state, STATE_WRITE)
         self.assertEqual(self.conn.rbuf, b"")
-        self.assertEqual(self.conn.wbuf, REPLY)
+        self.assertEqual(self.conn.wbuf, OK)
+        self.assertEqual(srv.g_map, {b"k": b"v"})
 
-    def test_split_3_then_8_bytes(self):
-        # The scenario walked through earlier: 3 bytes arrive, then 8 more
-        data = frame(b"set k v")
+    def test_split_3_then_rest(self):
+        data = req(b"set", b"k", b"v")
         self.conn.rbuf.extend(data[:3])
         self.process()
         self.assertEqual(self.conn.state, STATE_READ)
         self.conn.rbuf.extend(data[3:])
         self.process()
         self.assertEqual(self.conn.state, STATE_WRITE)
-        self.assertEqual(self.conn.wbuf, REPLY)
+        self.assertEqual(self.conn.wbuf, OK)
 
-    def test_pipelined_messages_get_one_reply_each(self):
-        self.conn.rbuf.extend(frame(b"a") + frame(b"b") + frame(b"c"))
+    def test_pipelined_requests_reply_in_order(self):
+        self.conn.rbuf.extend(req(b"set", b"k", b"v") + req(b"get", b"k") + req(b"get", b"nope"))
         self.process()
         self.assertEqual(self.conn.state, STATE_WRITE)
         self.assertEqual(self.conn.rbuf, b"")
-        self.assertEqual(self.conn.wbuf, REPLY * 3)
+        self.assertEqual(self.conn.wbuf, OK + reply(RES_OK, b"v") + NX)
 
-    def test_complete_message_then_partial(self):
-        partial = frame(b"hello")[:6]
-        self.conn.rbuf.extend(frame(b"one") + partial)
+    def test_complete_request_then_partial(self):
+        partial = req(b"get", b"k")[:6]
+        self.conn.rbuf.extend(req(b"set", b"k", b"v") + partial)
         self.process()
         self.assertEqual(self.conn.state, STATE_WRITE)  # reply to first is ready
-        self.assertEqual(self.conn.wbuf, REPLY)
+        self.assertEqual(self.conn.wbuf, OK)
         self.assertEqual(self.conn.rbuf, partial)  # second kept for later
 
-    def test_zero_length_message(self):
+    def test_zero_length_frame_is_bad_request(self):
         self.conn.rbuf.extend(frame(b""))
         self.process()
         self.assertEqual(self.conn.state, STATE_WRITE)
-        self.assertEqual(self.conn.wbuf, REPLY)
+        self.assertEqual(self.conn.wbuf, BAD_REQ)
 
-    def test_max_size_message_is_accepted(self):
-        self.conn.rbuf.extend(frame(b"x" * MAX_MSG_SIZE))
+    def test_malformed_payload_keeps_connection(self):
+        self.conn.rbuf.extend(frame(b"Hello, server!") + req(b"get", b"k"))
         self.process()
         self.assertEqual(self.conn.state, STATE_WRITE)
+        self.assertEqual(self.conn.wbuf, BAD_REQ + NX)
+
+    def test_max_size_request_is_accepted(self):
+        # nstr + (len + "set") + (len + "k") + (len + value) == MAX_MSG_SIZE
+        value = b"x" * (MAX_MSG_SIZE - 4 - 7 - 5 - 4)
+        data = req(b"set", b"k", value)
+        self.assertEqual(len(data), 4 + MAX_MSG_SIZE)
+        self.conn.rbuf.extend(data)
+        self.process()
+        self.assertEqual(self.conn.wbuf, OK)
+        self.assertEqual(srv.g_map[b"k"], value)
 
     def test_oversized_message_marks_delete(self):
         self.conn.rbuf.extend(struct.pack('<I', MAX_MSG_SIZE + 1))
         self.process()
         self.assertEqual(self.conn.state, STATE_DELETE)
         self.assertEqual(self.conn.wbuf, b"")
+
+    def test_command_exception_becomes_error_reply(self):
+        with mock.patch.object(srv, "process_command", side_effect=RuntimeError("boom")):
+            self.conn.rbuf.extend(req(b"get", b"k"))
+            self.process()
+        self.assertEqual(self.conn.state, STATE_WRITE)
+        self.assertEqual(self.conn.rbuf, b"")
+        self.assertEqual(self.conn.wbuf, reply(RES_ERR, b"internal error"))
 
 
 class TestFillBuffer(unittest.TestCase):
@@ -165,10 +332,11 @@ class TestFillBuffer(unittest.TestCase):
         self.assertEqual(bytes(self.conn.rbuf), data)
 
     def test_appends_to_existing_buffer(self):
-        self.conn.rbuf.extend(b"\x07\x00\x00")
-        self.peer.sendall(b"\x00set k v")
+        data = req(b"set", b"k", b"v")
+        self.conn.rbuf.extend(data[:3])
+        self.peer.sendall(data[3:])
         srv.fill_buffer(self.conn)
-        self.assertEqual(bytes(self.conn.rbuf), frame(b"set k v"))
+        self.assertEqual(bytes(self.conn.rbuf), data)
 
     def test_eof_marks_delete(self):
         self.peer.close()
@@ -192,13 +360,13 @@ class TestFlushBuffer(unittest.TestCase):
         self.peer.close()
 
     def test_full_send_returns_to_read(self):
-        self.conn.wbuf.extend(REPLY)
+        self.conn.wbuf.extend(OK)
         self.conn.state = STATE_WRITE
         srv.send_response(self.conn, None, None)
         self.assertEqual(self.conn.state, STATE_READ)
         self.assertEqual(self.conn.wbuf, b"")
         self.assertEqual(self.conn.wbuf_sent, 0)
-        self.assertEqual(recv_exact(self.peer, len(REPLY)), REPLY)
+        self.assertEqual(recv_exact(self.peer, len(OK)), OK)
 
     def test_empty_wbuf_returns_to_read(self):
         self.conn.state = STATE_WRITE
@@ -234,7 +402,7 @@ class TestFlushBuffer(unittest.TestCase):
     def test_send_to_closed_peer_raises_oserror(self):
         # connection_io relies on this being an OSError so it can drop the client
         self.peer.close()
-        self.conn.wbuf.extend(REPLY)
+        self.conn.wbuf.extend(OK)
         self.conn.state = STATE_WRITE
         with self.assertRaises(OSError):
             srv.send_response(self.conn, None, None)
@@ -242,6 +410,7 @@ class TestFlushBuffer(unittest.TestCase):
 
 class TestConnectionIO(unittest.TestCase):
     def setUp(self):
+        srv.g_map.clear()
         self.conn, self.peer = make_conn()
         self.poller = select.poll()
         self.poller.register(self.conn.fd, select.POLLIN)
@@ -255,19 +424,18 @@ class TestConnectionIO(unittest.TestCase):
         quiet(srv.connection_io, self.conn, event, self.poller, self.connections)
 
     def test_request_reply_cycle(self):
-        self.peer.sendall(frame(b"ping"))
+        self.peer.sendall(req(b"set", b"k", b"v"))
         self.io(select.POLLIN)
-        self.assertEqual(self.conn.state, STATE_WRITE)
-        self.io(select.POLLOUT)
+        # Small reply: process_and_flush sends it right away
         self.assertEqual(self.conn.state, STATE_READ)
-        self.assertEqual(recv_exact(self.peer, len(REPLY)), REPLY)
+        self.assertEqual(recv_exact(self.peer, len(OK)), OK)
         self.assertIn(self.conn.fd, self.connections)
 
-    def test_poller_watches_pollout_while_writing(self):
-        self.peer.sendall(frame(b"ping"))
+    def test_get_reply_carries_value(self):
+        self.peer.sendall(req(b"set", b"k", b"hello") + req(b"get", b"k"))
         self.io(select.POLLIN)
-        events = dict(self.poller.poll(1000))
-        self.assertTrue(events.get(self.conn.fd, 0) & select.POLLOUT)
+        self.assertEqual(read_reply(self.peer), (RES_OK, b""))
+        self.assertEqual(read_reply(self.peer), (RES_OK, b"hello"))
 
     def test_pollerr_removes_connection(self):
         fd = self.conn.fd
@@ -289,8 +457,8 @@ class TestConnectionIO(unittest.TestCase):
 
     def test_write_to_closed_peer_removes_connection(self):
         fd = self.conn.fd
-        self.peer.sendall(frame(b"ping"))
-        self.io(select.POLLIN)
+        self.conn.wbuf.extend(OK)
+        self.conn.state = STATE_WRITE
         self.peer.close()
         self.io(select.POLLOUT)
         self.assertNotIn(fd, self.connections)
@@ -309,11 +477,13 @@ def free_port() -> int:
 
 
 class TestServerIntegration(unittest.TestCase):
+    # g_map lives for the whole server process, so each test uses its own keys
+
     @classmethod
     def setUpClass(cls):
         cls.port = free_port()
         cls.proc = subprocess.Popen(
-            [sys.executable, '-c', f'import event_loop_server as s; s.run_server(port={cls.port})'],
+            [sys.executable, '-c', f'import server as s; s.run_server(port={cls.port})'],
             cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
         deadline = time.time() + 5
@@ -349,8 +519,9 @@ class TestServerIntegration(unittest.TestCase):
         self.socks.append(s)
         return s
 
-    def assert_reply(self, s, count=1):
-        self.assertEqual(recv_exact(s, len(REPLY) * count), REPLY * count)
+    def call(self, s, *args) -> tuple[int, bytes]:
+        s.sendall(req(*args))
+        return read_reply(s)
 
     def assert_closed_by_server(self, s):
         s.settimeout(3)
@@ -359,48 +530,74 @@ class TestServerIntegration(unittest.TestCase):
         except ConnectionResetError:
             pass  # also counts as closed
 
-    def test_single_request(self):
+    def test_set_get_del(self):
         s = self.client()
+        self.assertEqual(self.call(s, b"set", b"sgd", b"v"), (RES_OK, b""))
+        self.assertEqual(self.call(s, b"get", b"sgd"), (RES_OK, b"v"))
+        self.assertEqual(self.call(s, b"del", b"sgd"), (RES_OK, b""))
+        self.assertEqual(self.call(s, b"get", b"sgd"), (RES_NX, b""))
+
+    def test_del_twice(self):
+        # Used to crash the whole server (cmd[6] IndexError)
+        s = self.client()
+        self.assertEqual(self.call(s, b"del", b"twice"), (RES_OK, b""))
+        self.assertEqual(self.call(s, b"del", b"twice"), (RES_OK, b""))
+
+    def test_data_shared_across_connections(self):
+        a, b = self.client(), self.client()
+        self.call(a, b"set", b"shared", b"from-a")
+        self.assertEqual(self.call(b, b"get", b"shared"), (RES_OK, b"from-a"))
+
+    def test_binary_key_and_value(self):
+        s = self.client()
+        key, value = b"\x00\xffkey", bytes(range(256))
+        self.call(s, b"set", key, value)
+        self.assertEqual(self.call(s, b"get", key), (RES_OK, value))
+
+    def test_errors_keep_connection_open(self):
+        s = self.client()
+        self.assertEqual(self.call(s, b"foo"), (RES_ERR, b"Unknown cmd"))
         s.sendall(frame(b"Hello, server!"))
-        self.assert_reply(s)
+        self.assertEqual(read_reply(s), (RES_ERR, b"bad req"))
+        self.assertEqual(self.call(s, b"get", b"errs-nope"), (RES_NX, b""))
 
-    def test_sequential_requests_same_connection(self):
+    def test_message_split_3_then_rest(self):
         s = self.client()
-        for msg in [b"Hello, server!", b"Another message", b"Final message"]:
-            s.sendall(frame(msg))
-            self.assert_reply(s)
-
-    def test_message_split_3_then_8_bytes(self):
-        s = self.client()
-        data = frame(b"set k v")
+        data = req(b"set", b"split", b"v")
         s.sendall(data[:3])
         time.sleep(0.1)
         s.sendall(data[3:])
-        self.assert_reply(s)
+        self.assertEqual(read_reply(s), (RES_OK, b""))
 
     def test_one_byte_at_a_time(self):
         s = self.client()
-        for b in frame(b"slow message"):
+        for b in req(b"get", b"slow-nope"):
             s.sendall(bytes([b]))
             time.sleep(0.005)
-        self.assert_reply(s)
+        self.assertEqual(read_reply(s), (RES_NX, b""))
 
     def test_pipelined_requests(self):
         s = self.client()
-        s.sendall(b"".join(frame(b"msg %d" % i) for i in range(100)))
-        self.assert_reply(s, count=100)
+        s.sendall(b"".join(req(b"set", b"pipe%d" % i, b"%d" % i) for i in range(100)))
+        for _ in range(100):
+            self.assertEqual(read_reply(s), (RES_OK, b""))
+        s.sendall(b"".join(req(b"get", b"pipe%d" % i) for i in range(100)))
+        for i in range(100):
+            self.assertEqual(read_reply(s), (RES_OK, b"%d" % i))
 
     def test_complete_then_partial_still_gets_reply(self):
         s = self.client()
-        s.sendall(frame(b"one") + frame(b"hello")[:6])
-        self.assert_reply(s)
-        s.sendall(frame(b"hello")[6:])
-        self.assert_reply(s)
+        second = req(b"get", b"cp")
+        s.sendall(req(b"set", b"cp", b"v") + second[:6])
+        self.assertEqual(read_reply(s), (RES_OK, b""))
+        s.sendall(second[6:])
+        self.assertEqual(read_reply(s), (RES_OK, b"v"))
 
-    def test_max_size_message(self):
+    def test_max_size_request(self):
         s = self.client()
-        s.sendall(frame(b"x" * MAX_MSG_SIZE))
-        self.assert_reply(s)
+        value = b"x" * (MAX_MSG_SIZE - 4 - 7 - 7 - 4)  # key "big" is 3 bytes
+        self.assertEqual(self.call(s, b"set", b"big", value), (RES_OK, b""))
+        self.assertEqual(self.call(s, b"get", b"big"), (RES_OK, value))
 
     def test_oversized_message_closes_connection(self):
         s = self.client()
@@ -409,46 +606,48 @@ class TestServerIntegration(unittest.TestCase):
 
     def test_half_closed_client_still_gets_reply(self):
         s = self.client()
-        s.sendall(frame(b"last request"))
+        s.sendall(req(b"get", b"half-nope"))
         s.shutdown(socket.SHUT_WR)
-        self.assert_reply(s)
+        self.assertEqual(read_reply(s), (RES_NX, b""))
 
     def test_slow_client_does_not_block_others(self):
         slow = self.client()
-        slow.sendall(frame(b"partial")[:5])  # stuck mid-message
+        data = req(b"get", b"slow")
+        slow.sendall(data[:5])  # stuck mid-message
         fast = self.client()
-        fast.sendall(frame(b"quick"))
-        self.assert_reply(fast)
-        slow.sendall(frame(b"partial")[5:])
-        self.assert_reply(slow)
+        self.assertEqual(self.call(fast, b"set", b"slow", b"v"), (RES_OK, b""))
+        slow.sendall(data[5:])
+        self.assertEqual(read_reply(slow), (RES_OK, b"v"))
 
     def test_many_concurrent_clients(self):
         clients = [self.client() for _ in range(50)]
         for i, s in enumerate(clients):
-            s.sendall(frame(b"client %d" % i))
+            s.sendall(req(b"set", b"client%d" % i, b"%d" % i))
         for s in clients:
-            self.assert_reply(s)
+            self.assertEqual(read_reply(s), (RES_OK, b""))
+        for i, s in enumerate(clients):
+            self.assertEqual(self.call(s, b"get", b"client%d" % i), (RES_OK, b"%d" % i))
 
     def test_client_disconnect_mid_message(self):
         s = self.client()
-        s.sendall(frame(b"never finished")[:7])
+        s.sendall(req(b"set", b"never", b"finished")[:7])
         s.close()
         # server must still work for others
-        self.test_single_request()
+        self.assertEqual(self.call(self.client(), b"get", b"never"), (RES_NX, b""))
 
     def test_client_reset_does_not_kill_server(self):
         for _ in range(10):
             s = self.client()
             s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
-            s.sendall(frame(b"bye"))
+            s.sendall(req(b"get", b"bye"))
             s.close()  # linger 0 -> RST instead of FIN
-        self.test_single_request()
+        self.assertEqual(self.call(self.client(), b"get", b"bye"), (RES_NX, b""))
 
     def test_client_that_never_reads_replies(self):
         s = self.client()
-        s.sendall(b"".join(frame(b"x") for _ in range(1000)))
+        s.sendall(b"".join(req(b"get", b"x") for _ in range(1000)))
         s.close()
-        self.test_single_request()
+        self.assertEqual(self.call(self.client(), b"get", b"x"), (RES_NX, b""))
 
 
 if __name__ == '__main__':
